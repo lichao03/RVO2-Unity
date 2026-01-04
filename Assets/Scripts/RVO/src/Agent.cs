@@ -82,267 +82,365 @@ namespace RVO
         {
             orcaLines_.Clear();
 
+            // 第一阶段：为障碍物创建 ORCA 约束线
+            CreateObstacleORCALines();
+
+            int numObstLines = orcaLines_.Count;
+
+            // 第二阶段：为其他 Agent 创建 ORCA 约束线
+            CreateAgentORCALines();
+
+            // 第三阶段：求解线性规划，找到最优速度
+            SolveLinearProgram(numObstLines);
+        }
+
+        /// <summary>
+        /// 为所有障碍物邻居创建 ORCA 约束线
+        /// </summary>
+        private void CreateObstacleORCALines()
+        {
             float invTimeHorizonObst = 1.0f / timeHorizonObst_;
 
-            /* Create obstacle ORCA lines. */
             for (int i = 0; i < obstacleNeighbors_.Count; ++i)
             {
-
                 Obstacle obstacle1 = obstacleNeighbors_[i].Value;
                 Obstacle obstacle2 = obstacle1.next_;
 
                 Vector2 relativePosition1 = obstacle1.point_ - position_;
                 Vector2 relativePosition2 = obstacle2.point_ - position_;
 
-                /*
-                 * Check if velocity obstacle of obstacle is already taken care
-                 * of by previously constructed obstacle ORCA lines.
-                 */
-                bool alreadyCovered = false;
-
-                for (int j = 0; j < orcaLines_.Count; ++j)
-                {
-                    if (RVOMath.det(invTimeHorizonObst * relativePosition1 - orcaLines_[j].point, orcaLines_[j].direction) - invTimeHorizonObst * radius_ >= -RVOMath.RVO_EPSILON && RVOMath.det(invTimeHorizonObst * relativePosition2 - orcaLines_[j].point, orcaLines_[j].direction) - invTimeHorizonObst * radius_ >= -RVOMath.RVO_EPSILON)
-                    {
-                        alreadyCovered = true;
-
-                        break;
-                    }
-                }
-
-                if (alreadyCovered)
+                // 检查该障碍物是否已被之前的 ORCA 线覆盖
+                if (IsObstacleAlreadyCovered(relativePosition1, relativePosition2, invTimeHorizonObst))
                 {
                     continue;
                 }
 
-                /* Not yet covered. Check for collisions. */
-                float distSq1 = RVOMath.absSq(relativePosition1);
-                float distSq2 = RVOMath.absSq(relativePosition2);
-
-                float radiusSq = RVOMath.sqr(radius_);
-
-                Vector2 obstacleVector = obstacle2.point_ - obstacle1.point_;
-                float s = (-relativePosition1 * obstacleVector) / RVOMath.absSq(obstacleVector);
-                float distSqLine = RVOMath.absSq(-relativePosition1 - s * obstacleVector);
-
-                Line line;
-
-                if (s < 0.0f && distSq1 <= radiusSq)
+                // 检查碰撞情况并添加相应的 ORCA 线
+                if (TryAddCollisionORCALine(obstacle1, obstacle2, relativePosition1, relativePosition2))
                 {
-                    /* Collision with left vertex. Ignore if non-convex. */
-                    if (obstacle1.convex_)
-                    {
-                        line.point = new Vector2(0.0f, 0.0f);
-                        line.direction = RVOMath.normalize(new Vector2(-relativePosition1.y(), relativePosition1.x()));
-                        orcaLines_.Add(line);
-                    }
-
                     continue;
                 }
-                else if (s > 1.0f && distSq2 <= radiusSq)
-                {
-                    /*
-                     * Collision with right vertex. Ignore if non-convex or if
-                     * it will be taken care of by neighboring obstacle.
-                     */
-                    if (obstacle2.convex_ && RVOMath.det(relativePosition2, obstacle2.direction_) >= 0.0f)
-                    {
-                        line.point = new Vector2(0.0f, 0.0f);
-                        line.direction = RVOMath.normalize(new Vector2(-relativePosition2.y(), relativePosition2.x()));
-                        orcaLines_.Add(line);
-                    }
 
-                    continue;
-                }
-                else if (s >= 0.0f && s < 1.0f && distSqLine <= radiusSq)
+                // 无碰撞情况：计算速度障碍物的腿（legs）
+                ComputeAndAddVelocityObstacleORCALine(
+                    obstacle1, obstacle2, 
+                    relativePosition1, relativePosition2, 
+                    invTimeHorizonObst
+                );
+            }
+        }
+
+        /// <summary>
+        /// 检查障碍物是否已被现有的 ORCA 线覆盖
+        /// </summary>
+        private bool IsObstacleAlreadyCovered(Vector2 relativePosition1, Vector2 relativePosition2, float invTimeHorizonObst)
+        {
+            for (int j = 0; j < orcaLines_.Count; ++j)
+            {
+                float det1 = RVOMath.det(invTimeHorizonObst * relativePosition1 - orcaLines_[j].point, orcaLines_[j].direction);
+                float det2 = RVOMath.det(invTimeHorizonObst * relativePosition2 - orcaLines_[j].point, orcaLines_[j].direction);
+                
+                if (det1 - invTimeHorizonObst * radius_ >= -RVOMath.RVO_EPSILON && 
+                    det2 - invTimeHorizonObst * radius_ >= -RVOMath.RVO_EPSILON)
                 {
-                    /* Collision with obstacle segment. */
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 尝试为碰撞情况添加 ORCA 线（顶点碰撞或边碰撞）
+        /// </summary>
+        /// <returns>如果检测到碰撞并添加了 ORCA 线则返回 true</returns>
+        private bool TryAddCollisionORCALine(
+            Obstacle obstacle1, Obstacle obstacle2,
+            Vector2 relativePosition1, Vector2 relativePosition2)
+        {
+            float distSq1 = RVOMath.absSq(relativePosition1);
+            float distSq2 = RVOMath.absSq(relativePosition2);
+            float radiusSq = RVOMath.sqr(radius_);
+
+            Vector2 obstacleVector = obstacle2.point_ - obstacle1.point_;
+            float s = (-relativePosition1 * obstacleVector) / RVOMath.absSq(obstacleVector);
+            float distSqLine = RVOMath.absSq(-relativePosition1 - s * obstacleVector);
+
+            Line line;
+
+            // 情况1：与左顶点碰撞
+            if (s < 0.0f && distSq1 <= radiusSq)
+            {
+                if (obstacle1.convex_)
+                {
                     line.point = new Vector2(0.0f, 0.0f);
-                    line.direction = -obstacle1.direction_;
+                    line.direction = RVOMath.normalize(new Vector2(-relativePosition1.y(), relativePosition1.x()));
                     orcaLines_.Add(line);
-
-                    continue;
                 }
-
-                /*
-                 * No collision. Compute legs. When obliquely viewed, both legs
-                 * can come from a single vertex. Legs extend cut-off line when
-                 * non-convex vertex.
-                 */
-
-                Vector2 leftLegDirection, rightLegDirection;
-
-                if (s < 0.0f && distSqLine <= radiusSq)
-                {
-                    /*
-                     * Obstacle viewed obliquely so that left vertex
-                     * defines velocity obstacle.
-                     */
-                    if (!obstacle1.convex_)
-                    {
-                        /* Ignore obstacle. */
-                        continue;
-                    }
-
-                    obstacle2 = obstacle1;
-
-                    float leg1 = RVOMath.sqrt(distSq1 - radiusSq);
-                    leftLegDirection = new Vector2(relativePosition1.x() * leg1 - relativePosition1.y() * radius_, relativePosition1.x() * radius_ + relativePosition1.y() * leg1) / distSq1;
-                    rightLegDirection = new Vector2(relativePosition1.x() * leg1 + relativePosition1.y() * radius_, -relativePosition1.x() * radius_ + relativePosition1.y() * leg1) / distSq1;
-                }
-                else if (s > 1.0f && distSqLine <= radiusSq)
-                {
-                    /*
-                     * Obstacle viewed obliquely so that
-                     * right vertex defines velocity obstacle.
-                     */
-                    if (!obstacle2.convex_)
-                    {
-                        /* Ignore obstacle. */
-                        continue;
-                    }
-
-                    obstacle1 = obstacle2;
-
-                    float leg2 = RVOMath.sqrt(distSq2 - radiusSq);
-                    leftLegDirection = new Vector2(relativePosition2.x() * leg2 - relativePosition2.y() * radius_, relativePosition2.x() * radius_ + relativePosition2.y() * leg2) / distSq2;
-                    rightLegDirection = new Vector2(relativePosition2.x() * leg2 + relativePosition2.y() * radius_, -relativePosition2.x() * radius_ + relativePosition2.y() * leg2) / distSq2;
-                }
-                else
-                {
-                    /* Usual situation. */
-                    if (obstacle1.convex_)
-                    {
-                        float leg1 = RVOMath.sqrt(distSq1 - radiusSq);
-                        leftLegDirection = new Vector2(relativePosition1.x() * leg1 - relativePosition1.y() * radius_, relativePosition1.x() * radius_ + relativePosition1.y() * leg1) / distSq1;
-                    }
-                    else
-                    {
-                        /* Left vertex non-convex; left leg extends cut-off line. */
-                        leftLegDirection = -obstacle1.direction_;
-                    }
-
-                    if (obstacle2.convex_)
-                    {
-                        float leg2 = RVOMath.sqrt(distSq2 - radiusSq);
-                        rightLegDirection = new Vector2(relativePosition2.x() * leg2 + relativePosition2.y() * radius_, -relativePosition2.x() * radius_ + relativePosition2.y() * leg2) / distSq2;
-                    }
-                    else
-                    {
-                        /* Right vertex non-convex; right leg extends cut-off line. */
-                        rightLegDirection = obstacle1.direction_;
-                    }
-                }
-
-                /*
-                 * Legs can never point into neighboring edge when convex
-                 * vertex, take cutoff-line of neighboring edge instead. If
-                 * velocity projected on "foreign" leg, no constraint is added.
-                 */
-
-                Obstacle leftNeighbor = obstacle1.previous_;
-
-                bool isLeftLegForeign = false;
-                bool isRightLegForeign = false;
-
-                if (obstacle1.convex_ && RVOMath.det(leftLegDirection, -leftNeighbor.direction_) >= 0.0f)
-                {
-                    /* Left leg points into obstacle. */
-                    leftLegDirection = -leftNeighbor.direction_;
-                    isLeftLegForeign = true;
-                }
-
-                if (obstacle2.convex_ && RVOMath.det(rightLegDirection, obstacle2.direction_) <= 0.0f)
-                {
-                    /* Right leg points into obstacle. */
-                    rightLegDirection = obstacle2.direction_;
-                    isRightLegForeign = true;
-                }
-
-                /* Compute cut-off centers. */
-                Vector2 leftCutOff = invTimeHorizonObst * (obstacle1.point_ - position_);
-                Vector2 rightCutOff = invTimeHorizonObst * (obstacle2.point_ - position_);
-                Vector2 cutOffVector = rightCutOff - leftCutOff;
-
-                /* Project current velocity on velocity obstacle. */
-
-                /* Check if current velocity is projected on cutoff circles. */
-                float t = obstacle1 == obstacle2 ? 0.5f : ((velocity_ - leftCutOff) * cutOffVector) / RVOMath.absSq(cutOffVector);
-                float tLeft = (velocity_ - leftCutOff) * leftLegDirection;
-                float tRight = (velocity_ - rightCutOff) * rightLegDirection;
-
-                if ((t < 0.0f && tLeft < 0.0f) || (obstacle1 == obstacle2 && tLeft < 0.0f && tRight < 0.0f))
-                {
-                    /* Project on left cut-off circle. */
-                    Vector2 unitW = RVOMath.normalize(velocity_ - leftCutOff);
-
-                    line.direction = new Vector2(unitW.y(), -unitW.x());
-                    line.point = leftCutOff + radius_ * invTimeHorizonObst * unitW;
-                    orcaLines_.Add(line);
-
-                    continue;
-                }
-                else if (t > 1.0f && tRight < 0.0f)
-                {
-                    /* Project on right cut-off circle. */
-                    Vector2 unitW = RVOMath.normalize(velocity_ - rightCutOff);
-
-                    line.direction = new Vector2(unitW.y(), -unitW.x());
-                    line.point = rightCutOff + radius_ * invTimeHorizonObst * unitW;
-                    orcaLines_.Add(line);
-
-                    continue;
-                }
-
-                /*
-                 * Project on left leg, right leg, or cut-off line, whichever is
-                 * closest to velocity.
-                 */
-                float distSqCutoff = (t < 0.0f || t > 1.0f || obstacle1 == obstacle2) ? float.PositiveInfinity : RVOMath.absSq(velocity_ - (leftCutOff + t * cutOffVector));
-                float distSqLeft = tLeft < 0.0f ? float.PositiveInfinity : RVOMath.absSq(velocity_ - (leftCutOff + tLeft * leftLegDirection));
-                float distSqRight = tRight < 0.0f ? float.PositiveInfinity : RVOMath.absSq(velocity_ - (rightCutOff + tRight * rightLegDirection));
-
-                if (distSqCutoff <= distSqLeft && distSqCutoff <= distSqRight)
-                {
-                    /* Project on cut-off line. */
-                    line.direction = -obstacle1.direction_;
-                    line.point = leftCutOff + radius_ * invTimeHorizonObst * new Vector2(-line.direction.y(), line.direction.x());
-                    orcaLines_.Add(line);
-
-                    continue;
-                }
-
-                if (distSqLeft <= distSqRight)
-                {
-                    /* Project on left leg. */
-                    if (isLeftLegForeign)
-                    {
-                        continue;
-                    }
-
-                    line.direction = leftLegDirection;
-                    line.point = leftCutOff + radius_ * invTimeHorizonObst * new Vector2(-line.direction.y(), line.direction.x());
-                    orcaLines_.Add(line);
-
-                    continue;
-                }
-
-                /* Project on right leg. */
-                if (isRightLegForeign)
-                {
-                    continue;
-                }
-
-                line.direction = -rightLegDirection;
-                line.point = rightCutOff + radius_ * invTimeHorizonObst * new Vector2(-line.direction.y(), line.direction.x());
-                orcaLines_.Add(line);
+                return true;
             }
 
-            int numObstLines = orcaLines_.Count;
+            // 情况2：与右顶点碰撞
+            if (s > 1.0f && distSq2 <= radiusSq)
+            {
+                if (obstacle2.convex_ && RVOMath.det(relativePosition2, obstacle2.direction_) >= 0.0f)
+                {
+                    line.point = new Vector2(0.0f, 0.0f);
+                    line.direction = RVOMath.normalize(new Vector2(-relativePosition2.y(), relativePosition2.x()));
+                    orcaLines_.Add(line);
+                }
+                return true;
+            }
 
+            // 情况3：与障碍物边碰撞
+            if (s >= 0.0f && s < 1.0f && distSqLine <= radiusSq)
+            {
+                line.point = new Vector2(0.0f, 0.0f);
+                line.direction = -obstacle1.direction_;
+                orcaLines_.Add(line);
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 计算并添加速度障碍物的 ORCA 线（无碰撞情况）
+        /// </summary>
+        private void ComputeAndAddVelocityObstacleORCALine(
+            Obstacle obstacle1, Obstacle obstacle2,
+            Vector2 relativePosition1, Vector2 relativePosition2,
+            float invTimeHorizonObst)
+        {
+            float distSq1 = RVOMath.absSq(relativePosition1);
+            float distSq2 = RVOMath.absSq(relativePosition2);
+            float radiusSq = RVOMath.sqr(radius_);
+
+            Vector2 obstacleVector = obstacle2.point_ - obstacle1.point_;
+            float s = (-relativePosition1 * obstacleVector) / RVOMath.absSq(obstacleVector);
+            float distSqLine = RVOMath.absSq(-relativePosition1 - s * obstacleVector);
+
+            // 计算速度障碍物的左右腿方向
+            Vector2 leftLegDirection, rightLegDirection;
+
+            if (s < 0.0f && distSqLine <= radiusSq)
+            {
+                // 斜视障碍物，左顶点定义速度障碍物
+                if (!obstacle1.convex_) return;
+                
+                obstacle2 = obstacle1;
+                float leg1 = RVOMath.sqrt(distSq1 - radiusSq);
+                leftLegDirection = ComputeLegDirection(relativePosition1, leg1, radius_, distSq1, true);
+                rightLegDirection = ComputeLegDirection(relativePosition1, leg1, radius_, distSq1, false);
+            }
+            else if (s > 1.0f && distSqLine <= radiusSq)
+            {
+                // 斜视障碍物，右顶点定义速度障碍物
+                if (!obstacle2.convex_) return;
+                
+                obstacle1 = obstacle2;
+                float leg2 = RVOMath.sqrt(distSq2 - radiusSq);
+                leftLegDirection = ComputeLegDirection(relativePosition2, leg2, radius_, distSq2, true);
+                rightLegDirection = ComputeLegDirection(relativePosition2, leg2, radius_, distSq2, false);
+            }
+            else
+            {
+                // 常规情况：障碍物正面或侧面视角
+                ComputeNormalLegs(
+                    obstacle1, obstacle2,
+                    relativePosition1, relativePosition2,
+                    distSq1, distSq2, radiusSq,
+                    out leftLegDirection, out rightLegDirection
+                );
+            }
+
+            // 调整腿方向，避免指向相邻障碍物
+            AdjustLegsForNeighboringObstacles(
+                obstacle1, obstacle2,
+                ref leftLegDirection, ref rightLegDirection,
+                out bool isLeftLegForeign, out bool isRightLegForeign
+            );
+
+            // 投影当前速度并选择最佳 ORCA 线
+            ProjectVelocityAndAddORCALine(
+                obstacle1, obstacle2,
+                leftLegDirection, rightLegDirection,
+                isLeftLegForeign, isRightLegForeign,
+                invTimeHorizonObst
+            );
+        }
+
+        /// <summary>
+        /// 计算速度障碍物的腿方向（左腿或右腿）
+        /// </summary>
+        private Vector2 ComputeLegDirection(Vector2 relativePosition, float legLength, float radius, float distSq, bool isLeftLeg)
+        {
+            if (isLeftLeg)
+            {
+                return new Vector2(
+                    relativePosition.x() * legLength - relativePosition.y() * radius,
+                    relativePosition.x() * radius + relativePosition.y() * legLength
+                ) / distSq;
+            }
+            else
+            {
+                return new Vector2(
+                    relativePosition.x() * legLength + relativePosition.y() * radius,
+                    -relativePosition.x() * radius + relativePosition.y() * legLength
+                ) / distSq;
+            }
+        }
+
+        /// <summary>
+        /// 计算常规情况下的左右腿方向
+        /// </summary>
+        private void ComputeNormalLegs(
+            Obstacle obstacle1, Obstacle obstacle2,
+            Vector2 relativePosition1, Vector2 relativePosition2,
+            float distSq1, float distSq2, float radiusSq,
+            out Vector2 leftLegDirection, out Vector2 rightLegDirection)
+        {
+            // 计算左腿
+            if (obstacle1.convex_)
+            {
+                float leg1 = RVOMath.sqrt(distSq1 - radiusSq);
+                leftLegDirection = ComputeLegDirection(relativePosition1, leg1, radius_, distSq1, true);
+            }
+            else
+            {
+                // 左顶点非凸，左腿延伸切断线
+                leftLegDirection = -obstacle1.direction_;
+            }
+
+            // 计算右腿
+            if (obstacle2.convex_)
+            {
+                float leg2 = RVOMath.sqrt(distSq2 - radiusSq);
+                rightLegDirection = ComputeLegDirection(relativePosition2, leg2, radius_, distSq2, false);
+            }
+            else
+            {
+                // 右顶点非凸，右腿延伸切断线
+                rightLegDirection = obstacle1.direction_;
+            }
+        }
+
+        /// <summary>
+        /// 调整腿方向以避免指向相邻障碍物
+        /// </summary>
+        private void AdjustLegsForNeighboringObstacles(
+            Obstacle obstacle1, Obstacle obstacle2,
+            ref Vector2 leftLegDirection, ref Vector2 rightLegDirection,
+            out bool isLeftLegForeign, out bool isRightLegForeign)
+        {
+            Obstacle leftNeighbor = obstacle1.previous_;
+
+            isLeftLegForeign = false;
+            isRightLegForeign = false;
+
+            // 检查左腿是否指向障碍物内部
+            if (obstacle1.convex_ && RVOMath.det(leftLegDirection, -leftNeighbor.direction_) >= 0.0f)
+            {
+                leftLegDirection = -leftNeighbor.direction_;
+                isLeftLegForeign = true;
+            }
+
+            // 检查右腿是否指向障碍物内部
+            if (obstacle2.convex_ && RVOMath.det(rightLegDirection, obstacle2.direction_) <= 0.0f)
+            {
+                rightLegDirection = obstacle2.direction_;
+                isRightLegForeign = true;
+            }
+        }
+
+        /// <summary>
+        /// 将当前速度投影到速度障碍物上并添加最合适的 ORCA 线
+        /// </summary>
+        private void ProjectVelocityAndAddORCALine(
+            Obstacle obstacle1, Obstacle obstacle2,
+            Vector2 leftLegDirection, Vector2 rightLegDirection,
+            bool isLeftLegForeign, bool isRightLegForeign,
+            float invTimeHorizonObst)
+        {
+            // 计算切断中心点
+            Vector2 leftCutOff = invTimeHorizonObst * (obstacle1.point_ - position_);
+            Vector2 rightCutOff = invTimeHorizonObst * (obstacle2.point_ - position_);
+            Vector2 cutOffVector = rightCutOff - leftCutOff;
+
+            // 投影当前速度到速度障碍物
+            float t = obstacle1 == obstacle2 ? 0.5f : ((velocity_ - leftCutOff) * cutOffVector) / RVOMath.absSq(cutOffVector);
+            float tLeft = (velocity_ - leftCutOff) * leftLegDirection;
+            float tRight = (velocity_ - rightCutOff) * rightLegDirection;
+
+            Line line;
+
+            // 情况1：投影到左切断圆
+            if ((t < 0.0f && tLeft < 0.0f) || (obstacle1 == obstacle2 && tLeft < 0.0f && tRight < 0.0f))
+            {
+                Vector2 unitW = RVOMath.normalize(velocity_ - leftCutOff);
+                line.direction = new Vector2(unitW.y(), -unitW.x());
+                line.point = leftCutOff + radius_ * invTimeHorizonObst * unitW;
+                orcaLines_.Add(line);
+                return;
+            }
+
+            // 情况2：投影到右切断圆
+            if (t > 1.0f && tRight < 0.0f)
+            {
+                Vector2 unitW = RVOMath.normalize(velocity_ - rightCutOff);
+                line.direction = new Vector2(unitW.y(), -unitW.x());
+                line.point = rightCutOff + radius_ * invTimeHorizonObst * unitW;
+                orcaLines_.Add(line);
+                return;
+            }
+
+            // 情况3：选择最近的投影（切断线、左腿或右腿）
+            float distSqCutoff = (t < 0.0f || t > 1.0f || obstacle1 == obstacle2) 
+                ? float.PositiveInfinity 
+                : RVOMath.absSq(velocity_ - (leftCutOff + t * cutOffVector));
+            
+            float distSqLeft = tLeft < 0.0f 
+                ? float.PositiveInfinity 
+                : RVOMath.absSq(velocity_ - (leftCutOff + tLeft * leftLegDirection));
+            
+            float distSqRight = tRight < 0.0f 
+                ? float.PositiveInfinity 
+                : RVOMath.absSq(velocity_ - (rightCutOff + tRight * rightLegDirection));
+
+            // 投影到切断线
+            if (distSqCutoff <= distSqLeft && distSqCutoff <= distSqRight)
+            {
+                line.direction = -obstacle1.direction_;
+                line.point = leftCutOff + radius_ * invTimeHorizonObst * new Vector2(-line.direction.y(), line.direction.x());
+                orcaLines_.Add(line);
+                return;
+            }
+
+            // 投影到左腿
+            if (distSqLeft <= distSqRight)
+            {
+                if (isLeftLegForeign) return;
+
+                line.direction = leftLegDirection;
+                line.point = leftCutOff + radius_ * invTimeHorizonObst * new Vector2(-line.direction.y(), line.direction.x());
+                orcaLines_.Add(line);
+                return;
+            }
+
+            // 投影到右腿
+            if (isRightLegForeign) return;
+
+            line.direction = -rightLegDirection;
+            line.point = rightCutOff + radius_ * invTimeHorizonObst * new Vector2(-line.direction.y(), line.direction.x());
+            orcaLines_.Add(line);
+        }
+
+        /// <summary>
+        /// 为所有 Agent 邻居创建 ORCA 约束线
+        /// </summary>
+        private void CreateAgentORCALines()
+        {
             float invTimeHorizon = 1.0f / timeHorizon_;
 
-            /* Create agent ORCA lines. */
             for (int i = 0; i < agentNeighbors_.Count; ++i)
             {
                 Agent other = agentNeighbors_[i].Value;
@@ -358,63 +456,108 @@ namespace RVO
 
                 if (distSq > combinedRadiusSq)
                 {
-                    /* No collision. */
-                    Vector2 w = relativeVelocity - invTimeHorizon * relativePosition;
-
-                    /* Vector from cutoff center to relative velocity. */
-                    float wLengthSq = RVOMath.absSq(w);
-                    float dotProduct1 = w * relativePosition;
-
-                    if (dotProduct1 < 0.0f && RVOMath.sqr(dotProduct1) > combinedRadiusSq * wLengthSq)
-                    {
-                        /* Project on cut-off circle. */
-                        float wLength = RVOMath.sqrt(wLengthSq);
-                        Vector2 unitW = w / wLength;
-
-                        line.direction = new Vector2(unitW.y(), -unitW.x());
-                        u = (combinedRadius * invTimeHorizon - wLength) * unitW;
-                    }
-                    else
-                    {
-                        /* Project on legs. */
-                        float leg = RVOMath.sqrt(distSq - combinedRadiusSq);
-
-                        if (RVOMath.det(relativePosition, w) > 0.0f)
-                        {
-                            /* Project on left leg. */
-                            line.direction = new Vector2(relativePosition.x() * leg - relativePosition.y() * combinedRadius, relativePosition.x() * combinedRadius + relativePosition.y() * leg) / distSq;
-                        }
-                        else
-                        {
-                            /* Project on right leg. */
-                            line.direction = -new Vector2(relativePosition.x() * leg + relativePosition.y() * combinedRadius, -relativePosition.x() * combinedRadius + relativePosition.y() * leg) / distSq;
-                        }
-
-                        float dotProduct2 = relativeVelocity * line.direction;
-                        u = dotProduct2 * line.direction - relativeVelocity;
-                    }
+                    // 无碰撞：应用 ORCA 互惠避让
+                    u = ComputeORCAVectorNoCollision(
+                        relativePosition, relativeVelocity, 
+                        distSq, combinedRadius, combinedRadiusSq,
+                        invTimeHorizon, out line
+                    );
                 }
                 else
                 {
-                    /* Collision. Project on cut-off circle of time timeStep. */
-                    float invTimeStep = 1.0f / Simulator.Instance.timeStep_;
-
-                    /* Vector from cutoff center to relative velocity. */
-                    Vector2 w = relativeVelocity - invTimeStep * relativePosition;
-
-                    float wLength = RVOMath.abs(w);
-                    Vector2 unitW = w / wLength;
-
-                    line.direction = new Vector2(unitW.y(), -unitW.x());
-                    u = (combinedRadius * invTimeStep - wLength) * unitW;
+                    // 碰撞：紧急避让
+                    u = ComputeORCAVectorCollision(
+                        relativePosition, relativeVelocity,
+                        combinedRadius, out line
+                    );
                 }
 
+                // ORCA 线的点位于当前速度加上一半的避让向量（互惠原则）
                 line.point = velocity_ + 0.5f * u;
                 orcaLines_.Add(line);
             }
+        }
 
+        /// <summary>
+        /// 计算无碰撞情况下的 ORCA 避让向量
+        /// </summary>
+        private Vector2 ComputeORCAVectorNoCollision(
+            Vector2 relativePosition, Vector2 relativeVelocity,
+            float distSq, float combinedRadius, float combinedRadiusSq,
+            float invTimeHorizon, out Line line)
+        {
+            // w 是从切断中心到相对速度的向量
+            Vector2 w = relativeVelocity - invTimeHorizon * relativePosition;
+            float wLengthSq = RVOMath.absSq(w);
+            float dotProduct1 = w * relativePosition;
+
+            // 判断是投影到切断圆还是投影到腿
+            if (dotProduct1 < 0.0f && RVOMath.sqr(dotProduct1) > combinedRadiusSq * wLengthSq)
+            {
+                // 投影到切断圆
+                float wLength = RVOMath.sqrt(wLengthSq);
+                Vector2 unitW = w / wLength;
+
+                line.direction = new Vector2(unitW.y(), -unitW.x());
+                line.point = new Vector2(0.0f, 0.0f);
+                return (combinedRadius * invTimeHorizon - wLength) * unitW;
+            }
+            else
+            {
+                // 投影到腿（左腿或右腿）
+                float leg = RVOMath.sqrt(distSq - combinedRadiusSq);
+
+                if (RVOMath.det(relativePosition, w) > 0.0f)
+                {
+                    // 投影到左腿
+                    line.direction = new Vector2(
+                        relativePosition.x() * leg - relativePosition.y() * combinedRadius,
+                        relativePosition.x() * combinedRadius + relativePosition.y() * leg
+                    ) / distSq;
+                }
+                else
+                {
+                    // 投影到右腿
+                    line.direction = -new Vector2(
+                        relativePosition.x() * leg + relativePosition.y() * combinedRadius,
+                        -relativePosition.x() * combinedRadius + relativePosition.y() * leg
+                    ) / distSq;
+                }
+
+                float dotProduct2 = relativeVelocity * line.direction;
+                line.point = new Vector2(0.0f, 0.0f);
+                return dotProduct2 * line.direction - relativeVelocity;
+            }
+        }
+
+        /// <summary>
+        /// 计算碰撞情况下的 ORCA 避让向量（紧急避让）
+        /// </summary>
+        private Vector2 ComputeORCAVectorCollision(
+            Vector2 relativePosition, Vector2 relativeVelocity,
+            float combinedRadius, out Line line)
+        {
+            float invTimeStep = 1.0f / Simulator.Instance.timeStep_;
+
+            // 使用时间步长的切断圆（比时间视野更紧急）
+            Vector2 w = relativeVelocity - invTimeStep * relativePosition;
+            float wLength = RVOMath.abs(w);
+            Vector2 unitW = w / wLength;
+
+            line.direction = new Vector2(unitW.y(), -unitW.x());
+            line.point = new Vector2(0.0f, 0.0f);
+            return (combinedRadius * invTimeStep - wLength) * unitW;
+        }
+
+        /// <summary>
+        /// 求解线性规划问题，找到最优的新速度
+        /// </summary>
+        private void SolveLinearProgram(int numObstLines)
+        {
+            // 第一步：尝试用线性规划2求解（二维优化）
             int lineFail = linearProgram2(orcaLines_, maxSpeed_, prefVelocity_, false, ref newVelocity_);
 
+            // 第二步：如果失败，使用线性规划3求解（三维优化，允许违反部分约束）
             if (lineFail < orcaLines_.Count)
             {
                 linearProgram3(orcaLines_, numObstLines, lineFail, maxSpeed_, ref newVelocity_);
